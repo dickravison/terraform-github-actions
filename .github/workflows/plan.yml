@@ -1,0 +1,176 @@
+name: Plan and review
+
+on:
+  pull_request:
+
+env:
+  TF_ROOT: ./tf
+  TF_VERSION: 1.0.9
+
+jobs:
+  docs:
+    name: Generate docs
+    runs-on: ubuntu-20.04
+    steps:
+    #Check out code from the PR
+      - name: Check out code
+        uses: actions/checkout@v2
+
+    # Generate Terraform docs into README file.
+      - name: Render terraform docs and push changes back to PR
+        uses: terraform-docs/gh-actions@main
+        with:
+          find-dir: ${{ env.TF_ROOT }}
+          output-file: README.md
+          output-method: inject
+          git-push: "true"
+          git-commit-message: "terraform-docs: automated action"
+
+  lint:
+    name: Lint and validate Terraform
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: eu-west-1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Check the Terraform formatting
+        id: fmt
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform fmt -check -diff -recursive
+
+      - name: Run Terraform Init
+        id: init
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init
+
+      - name: Validate Terraform
+        id: validate
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform validate -no-color
+
+  checkov:
+    name: Check for security issues
+    needs: lint
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Run Checkov action
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: tf
+          quiet: true
+          soft_fail: true
+          output_format: cli
+
+      - name: Post checkov to GitHub PR
+        uses: mshick/add-pr-comment@v1
+        with:
+          allow-repeats: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          repo-token-user-login: 'github-actions[bot]'
+          message: |
+            ## Checkov summary
+            ```
+            ${{ env.CHECKOV_RESULTS }}
+            ```
+
+  plan:
+    name: Plan and provide a cost estimate
+    needs: lint
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-region: eu-west-1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Run Terraform Init
+        id: init
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform plan -no-color -input=false -out tf.plan
+        continue-on-error: true
+
+      - name: Post Plan to GitHub PR
+        uses: mshick/add-pr-comment@v1
+        with:
+          allow-repeats: true
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          repo-token-user-login: 'github-actions[bot]'
+          message: |
+            ## Terraform plan
+            ```
+            ${{ steps.plan.outputs.stdout || steps.plan.outputs.stderr }}
+            ```
+
+      - name: Terraform Plan JSON
+        id: json
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform show -json tf.plan > tf.json
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+      
+      # Checkout the base branch of the pull request (e.g. main/master).
+      - name: Checkout base branch
+        uses: actions/checkout@v2
+        with:
+          ref: '${{ github.event.pull_request.base.ref }}'
+
+      # Generate Infracost JSON file as the baseline.
+      - name: Generate Infracost cost estimate baseline
+        run: |
+          infracost breakdown --path=${TF_ROOT} \
+                              --format=json \
+                              --out-file=/tmp/infracost-base.json
+
+      # Checkout the current PR branch so we can create a diff.
+      - name: Checkout PR branch
+        uses: actions/checkout@v2
+
+      # Generate an Infracost diff and save it to a JSON file.
+      - name: Generate Infracost diff
+        run: |
+          infracost diff --path=${TF_ROOT} \
+                          --format=json \
+                          --compare-to=/tmp/infracost-base.json \
+                          --out-file=/tmp/infracost.json
+
+      - name: Post Infracost comment
+        run: |
+            infracost comment github --path=/tmp/infracost.json \
+                                      --repo=$GITHUB_REPOSITORY \
+                                      --github-token=${{github.token}} \
+                                      --pull-request=${{github.event.pull_request.number}} \
+                                      --behavior=new
