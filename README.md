@@ -5,4 +5,4 @@ Todo
 
 - Save plan as artifact for apply?
 - Cache terraform init?
-- Remove secrets containg keys and use OIDC provider
+- Remove secrets containing keys and use OIDC provider
